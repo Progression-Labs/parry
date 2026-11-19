@@ -53,7 +53,7 @@
 use crate::math::ComplexField;
 
 use crate::query::gjk::{ConstantOrigin, CsoPoint, VoronoiSimplex};
-use crate::shape::SupportMap;
+use crate::shape::{RoundShapeRef, SupportMap};
 // use query::Proximity;
 use crate::math::{Pose, Real, Vector, DIM};
 use crate::query::{self, Ray};
@@ -642,23 +642,56 @@ where
     G1: ?Sized + SupportMap,
     G2: ?Sized + SupportMap,
 {
+    directional_distance_dilated(pos12, g1, 0.0, g2, dir, simplex)
+}
+
+/// [`directional_distance`] between `g1` dilated by `border` (a ball of that radius swept over
+/// it, as a shape cast's `target_distance` makes it) and `g2`.
+pub(crate) fn directional_distance_dilated<G1, G2>(
+    pos12: &Pose,
+    g1: &G1,
+    border: Real,
+    g2: &G2,
+    dir: Vector,
+    simplex: &mut VoronoiSimplex,
+) -> Option<(Real, Vector, Vector, Vector)>
+where
+    G1: ?Sized + SupportMap,
+    G2: ?Sized + SupportMap,
+{
     let ray = Ray::new(Vector::ZERO, dir);
     let mut stalled = false;
-    let (time_of_impact, normal) = minkowski_ray_cast_inner(
-        pos12,
-        g1,
-        g2,
-        &ray,
-        Real::max_value(),
-        simplex,
-        &mut stalled,
-    )?;
+    let (time_of_impact, normal) = if border > 0.0 {
+        let round_g1 = RoundShapeRef {
+            inner_shape: g1,
+            border_radius: border,
+        };
+        minkowski_ray_cast_inner(
+            pos12,
+            &round_g1,
+            g2,
+            &ray,
+            Real::max_value(),
+            simplex,
+            &mut stalled,
+        )?
+    } else {
+        minkowski_ray_cast_inner(
+            pos12,
+            g1,
+            g2,
+            &ray,
+            Real::max_value(),
+            simplex,
+            &mut stalled,
+        )?
+    };
     if stalled {
         // The ray cast stopped making progress short of the Minkowski difference (a flat face
         // of each shape nearly parallel to the ray: a cylinder's disc passing over a box's
         // edge). Its time of impact is only a lower bound there, not a hit: go on from it by
         // conservative advancement on the shapes' real distance.
-        return advance_from(pos12, g1, g2, dir, time_of_impact);
+        return advance_from(pos12, g1, border, g2, dir, time_of_impact);
     }
     let witnesses = if !time_of_impact.is_zero() {
         result(simplex, simplex.dimension() == DIM)
@@ -676,9 +709,14 @@ where
 /// the distance stops shrinking first (the shapes pass each other). The distance between convex
 /// shapes along a straight motion is convex, so a step of the distance itself never passes the
 /// first touch, and a distance that is not shrinking never shrinks again.
+///
+/// The distance is measured between the undilated `g1` and `g2`, less `border`: GJK's distance
+/// to a rounded support map is off by millimetres beside a flat face (a cylinder dilated by
+/// 15 mm read 7 mm from a floor it touched, and the step went 7 mm into it).
 fn advance_from<G1, G2>(
     pos12: &Pose,
     g1: &G1,
+    border: Real,
     g2: &G2,
     dir: Vector,
     time_of_impact: Real,
@@ -694,30 +732,52 @@ where
     let unit = dir / speed;
     // As close as the ray cast's own convergence comes (its relative tolerance).
     let tolerance = <Real as ComplexField>::sqrt(eps_tol());
+    // Within the border where it starts (a cast from inside its target distance): a hit at once.
+    if let Some(contact) = query::details::contact_support_map_support_map(pos12, g1, g2, Real::MAX)
+    {
+        if contact.dist - border <= tolerance {
+            return Some((0.0, contact.normal1, Vector::ZERO, Vector::ZERO));
+        }
+    }
     let mut travel = time_of_impact * speed;
-    let mut last = None;
+    // The normal from the last query that found the shapes clearly apart: at a touch the closest
+    // points of two parallel faces are any pair within the tolerance of each other, and the
+    // vector between them turned a cylinder's down cast onto a floor 85 degrees off the vertical.
+    let mut apart = None;
     for _ in 0..64 {
         let mut at = *pos12;
         at.translation += unit * travel;
         let Some(contact) = query::details::contact_support_map_support_map(&at, g1, g2, Real::MAX)
         else {
-            // No answer where the last step, the distance itself, brought them: they touch.
-            return last;
+            // No answer where the distance itself brought them: they touch, and the
+            // witnesses are undefined, as for a penetration.
+            let normal = apart.unwrap_or(-unit);
+            return Some((travel / speed, normal, Vector::ZERO, Vector::ZERO));
         };
-        let hit = (
-            travel / speed,
-            contact.normal1,
-            contact.point1,
-            pos12.transform_point(contact.point2),
-        );
-        if contact.dist <= tolerance {
-            return Some(hit);
+        let dist = contact.dist - border;
+        if dist <= tolerance {
+            let normal = apart.unwrap_or_else(|| {
+                // Touching at the first query: ask again a little way back.
+                let mut back = at;
+                back.translation -= unit * (10.0 * tolerance);
+                query::details::contact_support_map_support_map(&back, g1, g2, Real::MAX)
+                    .filter(|c| c.dist - border > tolerance)
+                    .map_or(contact.normal1, |c| c.normal1)
+            });
+            return Some((
+                travel / speed,
+                normal,
+                contact.point1 + contact.normal1 * border,
+                pos12.transform_point(contact.point2),
+            ));
         }
         if contact.normal1.dot(unit) >= -crate::math::DEFAULT_EPSILON {
             return None;
         }
-        last = Some(hit);
-        travel += contact.dist;
+        if dist > 10.0 * tolerance {
+            apart = Some(contact.normal1);
+        }
+        travel += dist;
     }
     None
 }
