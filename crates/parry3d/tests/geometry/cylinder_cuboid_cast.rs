@@ -155,3 +155,67 @@ fn casts_at_a_box_hit_where_they_touch_and_miss_where_they_do_not() {
         }
     }
 }
+
+/// A cylinder standing a skin's width or a little more over a floor, cast straight down onto it
+/// with that skin as its target distance, hits it with the floor's normal, and never so late
+/// that the cylinder itself would touch the floor: a character's ground check. A stalled cast
+/// went on from its lower bound measuring the distance to the dilated cylinder, 7 mm off beside
+/// the flat face, and took its normal at the touch, up to 85 degrees off the vertical (a
+/// character lost the ground for a tick on a flat floor).
+///
+/// The plain ray cast on the dilated cylinder (not stalled) still lands up to 8 mm late, inside
+/// the skin, in 132 of these 12200 casts, as it does without the stall's fix (5332 of them off
+/// by over 1 mm there): printed, not held.
+#[test]
+fn cylinder_cast_down_onto_a_floor_hits_it() {
+    // As a character controller casts: kept a skin's width off what it meets.
+    const SKIN: f32 = 0.015;
+    let cylinder = Cylinder::new(0.8685, 0.24);
+    let floor = Cuboid::new(Vector::new(10.0, 0.5, 160.0));
+    let floor_at = Pose::from_translation(Vector::new(0.0, -0.5, -150.0));
+    let (mut wrong, mut late) = (vec![], 0);
+    for ci in 0..=60 {
+        let clearance = SKIN + ci as f32 * 0.0005;
+        for zi in 0..200 {
+            let at = Pose::from_translation(Vector::new(
+                0.0,
+                0.8685 + clearance,
+                -0.6 - zi as f32 * 0.0013,
+            ));
+            let hit = query::cast_shapes(
+                &at,
+                Vector::new(0.0, -1.0, 0.0),
+                &cylinder,
+                &floor_at,
+                Vector::ZERO,
+                &floor,
+                ShapeCastOptions {
+                    max_time_of_impact: 0.05 + SKIN,
+                    target_distance: SKIN,
+                    ..ShapeCastOptions::default()
+                },
+            )
+            .unwrap();
+            let error = hit.map(|h| h.time_of_impact - (clearance - SKIN));
+            match hit {
+                Some(h) if h.normal1.y < -0.999 && error.unwrap().abs() < SKIN => {
+                    if error.unwrap().abs() > 1.0e-3 {
+                        late += 1;
+                    }
+                }
+                other => wrong.push((
+                    clearance,
+                    at.translation.z,
+                    other.map(|h| (h.time_of_impact, h.normal1)),
+                )),
+            }
+        }
+    }
+    std::println!("{late} of 12200 casts down onto the floor hit over 1 mm off its skin");
+    assert!(
+        wrong.is_empty(),
+        "{} of 12200 casts down onto the floor missed, hit off the vertical or past the skin, e.g. {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(5)]
+    );
+}

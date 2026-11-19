@@ -3,7 +3,7 @@ use crate::query::details;
 use crate::query::details::ShapeCastOptions;
 use crate::query::gjk::{self, VoronoiSimplex};
 use crate::query::{ShapeCastHit, ShapeCastStatus};
-use crate::shape::{RoundShapeRef, SupportMap};
+use crate::shape::SupportMap;
 use num::Zero;
 
 /// Time of impacts between two support-mapped shapes under translational movement.
@@ -18,15 +18,14 @@ where
     G1: ?Sized + SupportMap,
     G2: ?Sized + SupportMap,
 {
-    let gjk_result = if options.target_distance > 0.0 {
-        let round_g1 = RoundShapeRef {
-            inner_shape: g1,
-            border_radius: options.target_distance,
-        };
-        gjk::directional_distance(pos12, &round_g1, g2, vel12, &mut VoronoiSimplex::new())
-    } else {
-        gjk::directional_distance(pos12, g1, g2, vel12, &mut VoronoiSimplex::new())
-    };
+    let gjk_result = gjk::directional_distance_dilated(
+        pos12,
+        g1,
+        options.target_distance.max(0.0),
+        g2,
+        vel12,
+        &mut VoronoiSimplex::new(),
+    );
 
     gjk_result.and_then(|(time_of_impact, normal1, witness1, witness2)| {
         if time_of_impact > options.max_time_of_impact {
