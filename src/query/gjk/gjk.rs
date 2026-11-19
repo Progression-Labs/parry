@@ -643,19 +643,83 @@ where
     G2: ?Sized + SupportMap,
 {
     let ray = Ray::new(Vector::ZERO, dir);
-    minkowski_ray_cast(pos12, g1, g2, &ray, Real::max_value(), simplex).map(
-        |(time_of_impact, normal)| {
-            let witnesses = if !time_of_impact.is_zero() {
-                result(simplex, simplex.dimension() == DIM)
-            } else {
-                // If there is penetration, the witness points
-                // are undefined.
-                (Vector::ZERO, Vector::ZERO)
-            };
+    let mut stalled = false;
+    let (time_of_impact, normal) = minkowski_ray_cast_inner(
+        pos12,
+        g1,
+        g2,
+        &ray,
+        Real::max_value(),
+        simplex,
+        &mut stalled,
+    )?;
+    if stalled {
+        // The ray cast stopped making progress short of the Minkowski difference (a flat face
+        // of each shape nearly parallel to the ray: a cylinder's disc passing over a box's
+        // edge). Its time of impact is only a lower bound there, not a hit: go on from it by
+        // conservative advancement on the shapes' real distance.
+        return advance_from(pos12, g1, g2, dir, time_of_impact);
+    }
+    let witnesses = if !time_of_impact.is_zero() {
+        result(simplex, simplex.dimension() == DIM)
+    } else {
+        // If there is penetration, the witness points
+        // are undefined.
+        (Vector::ZERO, Vector::ZERO)
+    };
 
-            (time_of_impact, normal, witnesses.0, witnesses.1)
-        },
-    )
+    Some((time_of_impact, normal, witnesses.0, witnesses.1))
+}
+
+/// From `time_of_impact` (a lower bound) on along `dir`, moves the second shape by the distance
+/// between the shapes until they touch, and returns as [`directional_distance`] does; None if
+/// the distance stops shrinking first (the shapes pass each other). The distance between convex
+/// shapes along a straight motion is convex, so a step of the distance itself never passes the
+/// first touch, and a distance that is not shrinking never shrinks again.
+fn advance_from<G1, G2>(
+    pos12: &Pose,
+    g1: &G1,
+    g2: &G2,
+    dir: Vector,
+    time_of_impact: Real,
+) -> Option<(Real, Vector, Vector, Vector)>
+where
+    G1: ?Sized + SupportMap,
+    G2: ?Sized + SupportMap,
+{
+    let speed = dir.length();
+    if speed <= crate::math::DEFAULT_EPSILON {
+        return None;
+    }
+    let unit = dir / speed;
+    // As close as the ray cast's own convergence comes (its relative tolerance).
+    let tolerance = <Real as ComplexField>::sqrt(eps_tol());
+    let mut travel = time_of_impact * speed;
+    let mut last = None;
+    for _ in 0..64 {
+        let mut at = *pos12;
+        at.translation += unit * travel;
+        let Some(contact) = query::details::contact_support_map_support_map(&at, g1, g2, Real::MAX)
+        else {
+            // No answer where the last step, the distance itself, brought them: they touch.
+            return last;
+        };
+        let hit = (
+            travel / speed,
+            contact.normal1,
+            contact.point1,
+            pos12.transform_point(contact.point2),
+        );
+        if contact.dist <= tolerance {
+            return Some(hit);
+        }
+        if contact.normal1.dot(unit) >= -crate::math::DEFAULT_EPSILON {
+            return None;
+        }
+        last = Some(hit);
+        travel += contact.dist;
+    }
+    None
 }
 
 // Ray-cast on the Minkowski Difference `g1 - pos12 * g2`.
@@ -666,6 +730,24 @@ fn minkowski_ray_cast<G1, G2>(
     ray: &Ray,
     max_time_of_impact: Real,
     simplex: &mut VoronoiSimplex,
+) -> Option<(Real, Vector)>
+where
+    G1: ?Sized + SupportMap,
+    G2: ?Sized + SupportMap,
+{
+    minkowski_ray_cast_inner(pos12, g1, g2, ray, max_time_of_impact, simplex, &mut false)
+}
+
+// [`minkowski_ray_cast`], saying in `stalled` when the result is the lower bound the cast
+// stopped making progress at rather than a converged hit.
+fn minkowski_ray_cast_inner<G1, G2>(
+    pos12: &Pose,
+    g1: &G1,
+    g2: &G2,
+    ray: &Ray,
+    max_time_of_impact: Real,
+    simplex: &mut VoronoiSimplex,
+    stalled: &mut bool,
 ) -> Option<(Real, Vector)>
 where
     G1: ?Sized + SupportMap,
@@ -719,6 +801,7 @@ where
 
         if last_chance && ltoi > 0.0 {
             // last_chance && ltoi > 0.0 && (support_point.point - curr_ray.origin).dot(ldir) >= 0.0 {
+            *stalled = true;
             return Some((ltoi / ray_length, ldir));
         }
 
